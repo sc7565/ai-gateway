@@ -1023,7 +1023,7 @@ func TestGatewayController_bspToFilterAPIBackendAuth(t *testing.T) {
 				Namespace: namespace,
 			}, bsp)
 			require.NoError(t, err)
-			auth, err := c.bspToFilterAPIBackendAuth(t.Context(), bsp)
+			auth, err := c.bspToFilterAPIBackendAuth(t.Context(), bsp, nil)
 			require.NoError(t, err)
 			require.Equal(t, tc.exp, auth)
 		})
@@ -1095,7 +1095,7 @@ func TestGatewayController_bspToFilterAPIBackendAuth_ErrorCases(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := c.bspToFilterAPIBackendAuth(ctx, tt.bsp)
+			result, err := c.bspToFilterAPIBackendAuth(ctx, tt.bsp, nil)
 			require.Error(t, err)
 			require.Contains(t, err.Error(), tt.expectedError)
 			require.Nil(t, result)

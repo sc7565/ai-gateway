@@ -441,18 +441,18 @@ func TestAWSHandler_Do(t *testing.T) {
 		wg.Wait()
 	})
 
-	t.Run("mantle authority infers bedrock service", func(t *testing.T) {
+	t.Run("mantle signing host infers bedrock service", func(t *testing.T) {
 		awsFileBody := "[default]\naws_access_key_id=test\naws_secret_access_key=secret\n"
 		handler, err := newAWSHandler(t.Context(), &filterapi.AWSAuth{
 			CredentialFileLiteral: awsFileBody,
 			Region:                "us-east-2",
+			SigningHost:           "bedrock-mantle.us-east-2.api.aws",
 		})
 		require.NoError(t, err)
 
 		hdrs, err := handler.Do(t.Context(), map[string]string{
-			":method":    "POST",
-			":path":      "/openai/v1/responses",
-			":authority": "bedrock-mantle.us-east-2.api.aws",
+			":method": "POST",
+			":path":   "/openai/v1/responses",
 		}, []byte(`{"model": "gpt-5.4"}`))
 		require.NoError(t, err)
 
@@ -478,6 +478,57 @@ func TestAWSHandler_Do(t *testing.T) {
 
 		headers := stringPairsToMap(hdrs)
 		require.Contains(t, headers["Authorization"], "/bedrock-agentcore/")
+	})
+
+	t.Run("mantle with per-request STS credentials", func(t *testing.T) {
+		t.Setenv("AWS_ACCESS_KEY_ID", "AKIADEFAULTKEY")
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "default-secret-key")
+
+		handler, err := newAWSHandler(t.Context(), &filterapi.AWSAuth{
+			Region:      "us-east-1",
+			SigningHost: "bedrock-mantle.us-east-1.api.aws",
+		})
+		require.NoError(t, err)
+
+		requestHeaders := map[string]string{
+			":method":                 "POST",
+			":path":                   "/openai/v1/responses",
+			"x-aws-access-key-id":     "ASIAPERUSERKEY",
+			"x-aws-secret-access-key": "per-user-secret-key",
+			"x-aws-session-token":     "per-user-session-token",
+		}
+
+		hdrs, err := handler.Do(t.Context(), requestHeaders, []byte(`{"model":"openai.gpt-5.5","input":"hi"}`))
+		require.NoError(t, err)
+
+		headers := stringPairsToMap(hdrs)
+		require.Contains(t, headers["Authorization"], "Credential=ASIAPERUSERKEY")
+		require.Contains(t, headers["Authorization"], "/bedrock/")
+		require.Contains(t, headers["Authorization"], "us-east-1")
+		require.Equal(t, "per-user-session-token", headers["X-Amz-Security-Token"])
+		require.NotContains(t, requestHeaders, "x-aws-access-key-id")
+	})
+
+	t.Run("controller signing host ignores client-facing authority", func(t *testing.T) {
+		awsFileBody := "[default]\naws_access_key_id=test\naws_secret_access_key=secret\n"
+		handler, err := newAWSHandler(t.Context(), &filterapi.AWSAuth{
+			CredentialFileLiteral: awsFileBody,
+			Region:                "us-west-2",
+			SigningHost:           "bedrock-runtime.us-west-2.amazonaws.com",
+		})
+		require.NoError(t, err)
+
+		hdrs, err := handler.Do(t.Context(), map[string]string{
+			":method":    "POST",
+			":path":      "/model/global.anthropic.claude-haiku-4-5-20251001-v1:0/invoke",
+			":authority": "ai-gateway.tools.stg.uw2.aws.zuora",
+		}, []byte(`{"anthropic_version":"bedrock-2023-05-31","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`))
+		require.NoError(t, err)
+
+		headers := stringPairsToMap(hdrs)
+		require.Contains(t, headers["Authorization"], "/bedrock/")
+		require.Contains(t, headers["Authorization"], "/us-west-2/")
+		require.NotContains(t, headers["Authorization"], "/ai-gateway/")
 	})
 }
 
@@ -512,57 +563,30 @@ func TestResolveAWSSigningHost(t *testing.T) {
 	tests := []struct {
 		name                string
 		explicitSigningHost string
-		authority           string
 		region              string
 		want                string
 	}{
 		{
 			name:                "explicit signing host wins",
 			explicitSigningHost: "bedrock-mantle.us-east-1.api.aws",
-			authority:           "localhost:61701",
 			region:              "us-east-1",
 			want:                "bedrock-mantle.us-east-1.api.aws",
 		},
 		{
-			name:      "regular authority is used",
-			authority: "bedrock-runtime.us-east-1.amazonaws.com",
-			region:    "us-east-1",
-			want:      "bedrock-runtime.us-east-1.amazonaws.com",
-		},
-		{
-			name:      "localhost authority falls back to runtime host",
-			authority: "localhost:61701",
-			region:    "us-east-1",
-			want:      "bedrock-runtime.us-east-1.amazonaws.com",
-		},
-		{
-			name:      "ipv4 authority falls back to runtime host",
-			authority: "127.0.0.1:61701",
-			region:    "us-east-1",
-			want:      "bedrock-runtime.us-east-1.amazonaws.com",
-		},
-		{
-			name:      "ipv6 authority falls back to runtime host",
-			authority: "[::1]:61701",
-			region:    "us-east-1",
-			want:      "bedrock-runtime.us-east-1.amazonaws.com",
-		},
-		{
-			name:      "bare bracket ipv6 authority falls back to runtime host",
-			authority: "[::1]",
-			region:    "us-east-1",
-			want:      "bedrock-runtime.us-east-1.amazonaws.com",
-		},
-		{
-			name:   "empty authority falls back to runtime host",
+			name:   "empty signing host falls back to runtime host",
 			region: "us-east-1",
 			want:   "bedrock-runtime.us-east-1.amazonaws.com",
+		},
+		{
+			name:   "region preserved in runtime fallback",
+			region: "us-west-2",
+			want:   "bedrock-runtime.us-west-2.amazonaws.com",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := resolveAWSSigningHost(tt.explicitSigningHost, tt.authority, tt.region)
+			got := resolveAWSSigningHost(tt.explicitSigningHost, tt.region)
 			require.Equal(t, tt.want, got)
 		})
 	}

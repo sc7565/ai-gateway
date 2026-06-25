@@ -427,6 +427,7 @@ func (c *GatewayController) reconcileFilterConfigSecret(
 				b.ModelNameOverride = backendRef.ModelNameOverride
 
 				var bsp *aigv1b1.BackendSecurityPolicy
+				var aiServiceBackend *aigv1b1.AIServiceBackend
 				backendNamespace := backendRef.GetNamespace(aiGatewayRoute.Namespace)
 
 				if backendRef.IsInferencePool() {
@@ -447,6 +448,7 @@ func (c *GatewayController) reconcileFilterConfigSecret(
 				} else {
 					var backendObj *aigv1b1.AIServiceBackend
 					backendObj, bsp, err = c.backendWithMaybeBSP(ctx, backendNamespace, backendRef.Name)
+					aiServiceBackend = backendObj
 					if err != nil {
 						c.logger.Error(err, "failed to get backend or backend security policy. Skipping this backend.",
 							"backend_name", backendRef.Name, "aigatewayroute", aiGatewayRoute.Name,
@@ -474,7 +476,7 @@ func (c *GatewayController) reconcileFilterConfigSecret(
 				}
 
 				if bsp != nil {
-					b.Auth, err = c.bspToFilterAPIBackendAuth(ctx, bsp)
+					b.Auth, err = c.bspToFilterAPIBackendAuth(ctx, bsp, aiServiceBackend)
 					if err != nil {
 						c.logger.Error(err, "failed to get backend auth from backend security policy. Skipping this backend.",
 							"backend_name", backendRef.Name, "backend_security_policy", bsp.Name,
@@ -670,7 +672,7 @@ func mcpConfig(mcpRoutes []aigv1b1.MCPRoute) (_ *filterapi.MCPConfig, hasEffecti
 	return mc, hasEffectiveRoute
 }
 
-func (c *GatewayController) bspToFilterAPIBackendAuth(ctx context.Context, backendSecurityPolicy *aigv1b1.BackendSecurityPolicy) (*filterapi.BackendAuth, error) {
+func (c *GatewayController) bspToFilterAPIBackendAuth(ctx context.Context, backendSecurityPolicy *aigv1b1.BackendSecurityPolicy, aiServiceBackend *aigv1b1.AIServiceBackend) (*filterapi.BackendAuth, error) {
 	namespace := backendSecurityPolicy.Namespace
 	switch backendSecurityPolicy.Spec.Type {
 	case aigv1b1.BackendSecurityPolicyTypeAPIKey:
@@ -706,6 +708,13 @@ func (c *GatewayController) bspToFilterAPIBackendAuth(ctx context.Context, backe
 		}
 		if awsCred.SigningHost != nil {
 			signingHost = *awsCred.SigningHost
+		}
+		if signingHost == "" && aiServiceBackend != nil {
+			host, err := c.resolveBackendFQDNHostname(ctx, namespace, aiServiceBackend.Spec.BackendRef)
+			if err != nil {
+				return nil, fmt.Errorf("failed to resolve AWS signing host for BackendSecurityPolicy %s: %w", backendSecurityPolicy.Name, err)
+			}
+			signingHost = host
 		}
 
 		// If no credentials file or OIDC token is configured, use default credential chain
@@ -886,6 +895,35 @@ func (c *GatewayController) injectQuotaPolicyCostExpressions(
 // is active per request, and ext_proc filters cost entries by Model before
 // writing to this key.
 const QuotaCostMetadataKey = "quota_cost"
+
+// resolveBackendFQDNHostname returns the upstream hostname from an Envoy Gateway Backend resource.
+// SigV4 signs over the host AWS ultimately sees; Envoy rewrites :authority to this hostname on
+// the upstream request, so the extproc signer must use the same value from config, not the
+// client-facing :authority visible at signing time.
+func (c *GatewayController) resolveBackendFQDNHostname(ctx context.Context, namespace string, ref gwapiv1.BackendObjectReference) (string, error) {
+	backendNamespace := namespace
+	if ref.Namespace != nil {
+		backendNamespace = string(*ref.Namespace)
+	}
+	backendName := string(ref.Name)
+
+	var backend egv1a1.Backend
+	if err := c.client.Get(ctx, client.ObjectKey{Name: backendName, Namespace: backendNamespace}, &backend); err != nil {
+		return "", fmt.Errorf("failed to get Backend %s/%s: %w", backendNamespace, backendName, err)
+	}
+
+	for i := range backend.Spec.Endpoints {
+		ep := &backend.Spec.Endpoints[i]
+		if ep.FQDN != nil && ep.FQDN.Hostname != "" {
+			return ep.FQDN.Hostname, nil
+		}
+		if ep.Hostname != nil && *ep.Hostname != "" {
+			return *ep.Hostname, nil
+		}
+	}
+
+	return "", fmt.Errorf("Backend %s/%s has no FQDN/hostname endpoint", backendNamespace, backendName)
+}
 
 // backendWithMaybeBSP retrieves the AIServiceBackend and its associated BackendSecurityPolicy if it exists.
 func (c *GatewayController) backendWithMaybeBSP(ctx context.Context, namespace, name string) (backend *aigv1b1.AIServiceBackend, bsp *aigv1b1.BackendSecurityPolicy, err error) {
