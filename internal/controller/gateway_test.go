@@ -53,7 +53,7 @@ func TestGatewayController_Reconcile(t *testing.T) {
 	fakeClient := requireNewFakeClientWithIndexes(t)
 	fakeKube := fake2.NewClientset()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zap.Options{Development: true, Level: zapcore.DebugLevel})))
-	c := NewGatewayController(fakeClient, fakeKube, ctrl.Log,
+	c := NewGatewayController(fakeClient, fakeKube, ctrl.Log, "envoy-gateway-system",
 		"docker.io/envoyproxy/ai-gateway-extproc:latest", "info", false, nil, true)
 
 	const namespace = "ns"
@@ -175,7 +175,7 @@ func TestGatewayController_reconcileFilterConfigSecret(t *testing.T) {
 	fakeClient := requireNewFakeClientWithIndexes(t)
 	kube := fake2.NewClientset()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zap.Options{Development: true, Level: zapcore.DebugLevel})))
-	c := NewGatewayController(fakeClient, kube, ctrl.Log,
+	c := NewGatewayController(fakeClient, kube, ctrl.Log, "envoy-gateway-system",
 		"docker.io/envoyproxy/ai-gateway-extproc:latest", "info", false, nil, true)
 
 	const gwNamespace = "ns"
@@ -329,7 +329,7 @@ func TestGatewayController_reconcileFilterConfigSecret_HostnameScopedModels(t *t
 	fakeClient := requireNewFakeClientWithIndexes(t)
 	kube := fake2.NewClientset()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zap.Options{Development: true, Level: zapcore.DebugLevel})))
-	c := NewGatewayController(fakeClient, kube, ctrl.Log,
+	c := NewGatewayController(fakeClient, kube, ctrl.Log, "envoy-gateway-system",
 		"docker.io/envoyproxy/ai-gateway-extproc:latest", "info", false, nil, true)
 
 	const gwNamespace = "ns"
@@ -425,7 +425,7 @@ func TestGatewayController_reconcileFilterConfigSecret_AllUnscopedRoutesLeaveUns
 	fakeClient := requireNewFakeClientWithIndexes(t)
 	kube := fake2.NewClientset()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zap.Options{Development: true, Level: zapcore.DebugLevel})))
-	c := NewGatewayController(fakeClient, kube, ctrl.Log,
+	c := NewGatewayController(fakeClient, kube, ctrl.Log, "envoy-gateway-system",
 		"docker.io/envoyproxy/ai-gateway-extproc:latest", "info", false, nil, true)
 
 	const gwNamespace = "ns"
@@ -479,7 +479,7 @@ func TestGatewayController_reconcileFilterConfigSecret_RouteLevelLLMRequestCostA
 	fakeClient := requireNewFakeClientWithIndexes(t)
 	kube := fake2.NewClientset()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zap.Options{Development: true, Level: zapcore.DebugLevel})))
-	c := NewGatewayController(fakeClient, kube, ctrl.Log,
+	c := NewGatewayController(fakeClient, kube, ctrl.Log, "envoy-gateway-system",
 		"docker.io/envoyproxy/ai-gateway-extproc:latest", "info", false, nil, true)
 
 	const gwNamespace = "ns"
@@ -580,7 +580,7 @@ func TestGatewayController_reconcileFilterConfigSecret_RouteLevelLLMRequestCostA
 	fakeClient := requireNewFakeClientWithIndexes(t)
 	kube := fake2.NewClientset()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zap.Options{Development: true, Level: zapcore.DebugLevel})))
-	c := NewGatewayController(fakeClient, kube, ctrl.Log,
+	c := NewGatewayController(fakeClient, kube, ctrl.Log, "envoy-gateway-system",
 		"docker.io/envoyproxy/ai-gateway-extproc:latest", "info", false, nil, true)
 
 	const gwNamespace = "ns"
@@ -636,7 +636,7 @@ func TestGatewayController_reconcileFilterConfigSecret_InvalidCELExpression(t *t
 	fakeClient := requireNewFakeClientWithIndexes(t)
 	kube := fake2.NewClientset()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zap.Options{Development: true, Level: zapcore.DebugLevel})))
-	c := NewGatewayController(fakeClient, kube, ctrl.Log,
+	c := NewGatewayController(fakeClient, kube, ctrl.Log, "envoy-gateway-system",
 		"docker.io/envoyproxy/ai-gateway-extproc:latest", "info", false, nil, true)
 
 	const gwNamespace = "ns"
@@ -675,7 +675,7 @@ func TestGatewayController_reconcileFilterConfigSecret_SkipsDeletedRoutes(t *tes
 	fakeClient := requireNewFakeClientWithIndexes(t)
 	kube := fake2.NewClientset()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zap.Options{Development: true, Level: zapcore.DebugLevel})))
-	c := NewGatewayController(fakeClient, kube, ctrl.Log,
+	c := NewGatewayController(fakeClient, kube, ctrl.Log, "envoy-gateway-system",
 		"docker.io/envoyproxy/ai-gateway-extproc:latest", "info", false, nil, true)
 
 	const gwNamespace = "ns"
@@ -786,8 +786,7 @@ func TestGatewayController_bspToFilterAPIBackendAuth(t *testing.T) {
 	fakeClient := requireNewFakeClientWithIndexes(t)
 	kube := fake2.NewClientset()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zap.Options{Development: true, Level: zapcore.DebugLevel})))
-	c := NewGatewayController(fakeClient, kube, ctrl.Log,
-
+	c := NewGatewayController(fakeClient, kube, ctrl.Log, "envoy-gateway-system",
 		"docker.io/envoyproxy/ai-gateway-extproc:latest", "info", false, nil, true)
 
 	const namespace = "ns"
@@ -828,6 +827,31 @@ func TestGatewayController_bspToFilterAPIBackendAuth(t *testing.T) {
 				AWSCredentials: &aigv1b1.BackendSecurityPolicyAWSCredentials{
 					Region: "us-west-2",
 					// No CredentialsFile or OIDCExchangeToken - uses default credential chain
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "aws-default-chain-overrides", Namespace: namespace},
+			Spec: aigv1b1.BackendSecurityPolicySpec{
+				Type: aigv1b1.BackendSecurityPolicyTypeAWSCredentials,
+				AWSCredentials: &aigv1b1.BackendSecurityPolicyAWSCredentials{
+					Region:      "us-east-2",
+					Service:     ptr.To("bedrock"),
+					SigningHost: ptr.To("bedrock-mantle.us-east-2.api.aws"),
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "aws-credentials-file-overrides", Namespace: namespace},
+			Spec: aigv1b1.BackendSecurityPolicySpec{
+				Type: aigv1b1.BackendSecurityPolicyTypeAWSCredentials,
+				AWSCredentials: &aigv1b1.BackendSecurityPolicyAWSCredentials{
+					Region:      "us-east-2",
+					Service:     ptr.To("bedrock"),
+					SigningHost: ptr.To("bedrock-mantle.us-east-2.api.aws"),
+					CredentialsFile: &aigv1b1.AWSCredentialsFile{
+						SecretRef: &gwapiv1.SecretObjectReference{Name: "aws-credentials-file-secret"},
+					},
 				},
 			},
 		},
@@ -944,6 +968,27 @@ func TestGatewayController_bspToFilterAPIBackendAuth(t *testing.T) {
 			},
 		},
 		{
+			bspName: "aws-default-chain-overrides",
+			exp: &filterapi.BackendAuth{
+				AWSAuth: &filterapi.AWSAuth{
+					Region:      "us-east-2",
+					Service:     "bedrock",
+					SigningHost: "bedrock-mantle.us-east-2.api.aws",
+				},
+			},
+		},
+		{
+			bspName: "aws-credentials-file-overrides",
+			exp: &filterapi.BackendAuth{
+				AWSAuth: &filterapi.AWSAuth{
+					CredentialFileLiteral: "thisisawscredentials",
+					Region:                "us-east-2",
+					Service:               "bedrock",
+					SigningHost:           "bedrock-mantle.us-east-2.api.aws",
+				},
+			},
+		},
+		{
 			bspName: "azure-oidc",
 			exp: &filterapi.BackendAuth{
 				AzureAuth: &filterapi.AzureAuth{AccessToken: "thisisazurecredentials"},
@@ -978,7 +1023,7 @@ func TestGatewayController_bspToFilterAPIBackendAuth(t *testing.T) {
 				Namespace: namespace,
 			}, bsp)
 			require.NoError(t, err)
-			auth, err := c.bspToFilterAPIBackendAuth(t.Context(), bsp)
+			auth, err := c.bspToFilterAPIBackendAuth(t.Context(), bsp, nil)
 			require.NoError(t, err)
 			require.Equal(t, tc.exp, auth)
 		})
@@ -987,7 +1032,7 @@ func TestGatewayController_bspToFilterAPIBackendAuth(t *testing.T) {
 
 func TestGatewayController_bspToFilterAPIBackendAuth_ErrorCases(t *testing.T) {
 	fakeClient := requireNewFakeClientWithIndexes(t)
-	c := NewGatewayController(fakeClient, fake2.NewClientset(), ctrl.Log,
+	c := NewGatewayController(fakeClient, fake2.NewClientset(), ctrl.Log, "envoy-gateway-system",
 		"docker.io/envoyproxy/ai-gateway-extproc:latest", "info", false, nil, true)
 
 	ctx := context.Background()
@@ -1034,11 +1079,23 @@ func TestGatewayController_bspToFilterAPIBackendAuth_ErrorCases(t *testing.T) {
 			},
 			expectedError: "failed to get secret missing-aws-secret",
 		},
+		{
+			name:    "aws credentials type with nil AWSCredentials",
+			bspName: "aws-nil-creds-bsp",
+			bsp: &aigv1b1.BackendSecurityPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "aws-nil-creds-bsp", Namespace: namespace},
+				Spec: aigv1b1.BackendSecurityPolicySpec{
+					Type:           aigv1b1.BackendSecurityPolicyTypeAWSCredentials,
+					AWSCredentials: nil,
+				},
+			},
+			expectedError: "AWSCredentials is nil for BackendSecurityPolicy aws-nil-creds-bsp",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := c.bspToFilterAPIBackendAuth(ctx, tt.bsp)
+			result, err := c.bspToFilterAPIBackendAuth(ctx, tt.bsp, nil)
 			require.Error(t, err)
 			require.Contains(t, err.Error(), tt.expectedError)
 			require.Nil(t, result)
@@ -1048,7 +1105,7 @@ func TestGatewayController_bspToFilterAPIBackendAuth_ErrorCases(t *testing.T) {
 
 func TestGatewayController_GetSecretData_ErrorCases(t *testing.T) {
 	fakeClient := requireNewFakeClientWithIndexes(t)
-	c := NewGatewayController(fakeClient, fake2.NewClientset(), ctrl.Log,
+	c := NewGatewayController(fakeClient, fake2.NewClientset(), ctrl.Log, "envoy-gateway-system",
 		"docker.io/envoyproxy/ai-gateway-extproc:latest", "info", false, nil, true)
 
 	ctx := context.Background()
@@ -1074,7 +1131,7 @@ func TestGatewayController_annotateGatewayPods(t *testing.T) {
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zap.Options{Development: true, Level: zapcore.DebugLevel})))
 	const v2Container = "ai-gateway-extproc:v2"
 	const logLevel = "info"
-	c := NewGatewayController(fakeClient, kube, ctrl.Log,
+	c := NewGatewayController(fakeClient, kube, ctrl.Log, "envoy-gateway-system",
 		v2Container, logLevel, false, nil, true)
 	t.Run("pod with extproc", func(t *testing.T) {
 		pod, err := kube.CoreV1().Pods(egNamespace).Create(t.Context(), &corev1.Pod{
@@ -1635,7 +1692,7 @@ func TestGatewayController_annotateDaemonSetGatewayPods(t *testing.T) {
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zap.Options{Development: true, Level: zapcore.DebugLevel})))
 	const v2Container = "ai-gateway-extproc:v2"
 	const logLevel = "info"
-	c := NewGatewayController(fakeClient, kube, ctrl.Log,
+	c := NewGatewayController(fakeClient, kube, ctrl.Log, "envoy-gateway-system",
 		v2Container, logLevel, false, nil, true)
 
 	t.Run("pod without extproc", func(t *testing.T) {
@@ -2048,7 +2105,7 @@ func TestGatewayController_backendWithMaybeBSP(t *testing.T) {
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zap.Options{Development: true, Level: zapcore.DebugLevel})))
 	const v2Container = "ai-gateway-extproc:v2"
 	const logLevel = "info"
-	c := NewGatewayController(fakeClient, kube, ctrl.Log, v2Container, logLevel, false, nil, true)
+	c := NewGatewayController(fakeClient, kube, ctrl.Log, "envoy-gateway-system", v2Container, logLevel, false, nil, true)
 
 	_, _, err := c.backendWithMaybeBSP(t.Context(), "foo", "bar")
 	require.ErrorContains(t, err, `aiservicebackends.aigateway.envoyproxy.io "bar" not found`)
@@ -2107,7 +2164,7 @@ func TestGatewayController_reconcileFilterMCPConfigSecret(t *testing.T) {
 	fakeClient := requireNewFakeClientWithIndexes(t)
 	kube := fake2.NewClientset()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zap.Options{Development: true, Level: zapcore.DebugLevel})))
-	c := NewGatewayController(fakeClient, kube, ctrl.Log,
+	c := NewGatewayController(fakeClient, kube, ctrl.Log, "envoy-gateway-system",
 		"docker.io/envoyproxy/ai-gateway-extproc:latest", "info", false, nil, true)
 
 	const gwNamespace = "ns"
@@ -2599,7 +2656,7 @@ func TestGatewayController_reconcileFilterConfigSecret_GlobalDefaults(t *testing
 			fakeClient := requireNewFakeClientWithIndexes(t)
 			kube := fake2.NewClientset()
 			ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zap.Options{Development: true, Level: zapcore.DebugLevel})))
-			c := NewGatewayController(fakeClient, kube, ctrl.Log,
+			c := NewGatewayController(fakeClient, kube, ctrl.Log, "envoy-gateway-system",
 				"docker.io/envoyproxy/ai-gateway-extproc:latest", "info", false, nil, true)
 
 			const gwNamespace = "ns"
@@ -2811,4 +2868,30 @@ func Test_mergeBodyMutations(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGatewayController_getObjectsForGatewayNamespaceInconsistency(t *testing.T) {
+	const gwName, gwNamespace, egNamespace = "gw", "ns", "envoy-gateway-system"
+	labels := map[string]string{
+		egOwningGatewayNameLabel:      gwName,
+		egOwningGatewayNamespaceLabel: gwNamespace,
+	}
+	gw := &gwapiv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: gwName, Namespace: gwNamespace}}
+
+	kube := fake2.NewClientset()
+	c := NewGatewayController(requireNewFakeClientWithIndexes(t), kube, ctrl.Log, egNamespace,
+		"docker.io/envoyproxy/ai-gateway-extproc:latest", "info", false, nil, true)
+
+	// Place a pod in the gateway namespace and a pod in the envoy-gateway namespace so that
+	// objects are found in two distinct namespaces, which should trigger the error.
+	for _, ns := range []string{gwNamespace, egNamespace} {
+		_, err := kube.CoreV1().Pods(ns).Create(t.Context(), &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "pod-" + ns, Namespace: ns, Labels: labels},
+		}, metav1.CreateOptions{})
+		require.NoError(t, err)
+	}
+
+	_, _, _, _, err := c.getObjectsForGateway(t.Context(), gw)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "found gateway-labeled objects in multiple namespaces")
 }

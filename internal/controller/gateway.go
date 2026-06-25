@@ -49,7 +49,7 @@ const (
 // extProcImage is the image of the external processor sidecar container which will be used
 // to check if the pods of the gateway deployment need to be rolled out.
 func NewGatewayController(
-	client client.Client, kube kubernetes.Interface, logger logr.Logger,
+	client client.Client, kube kubernetes.Interface, logger logr.Logger, envoyGatewayNamespace string,
 	extProcImage string, extProcLogLevel string, standAlone bool, uuidFn func() string, extProcAsSideCar bool,
 ) *GatewayController {
 	uf := uuidFn
@@ -57,24 +57,26 @@ func NewGatewayController(
 		uf = uuid.NewString
 	}
 	return &GatewayController{
-		client:           client,
-		kube:             kube,
-		logger:           logger,
-		extProcImage:     extProcImage,
-		extProcLogLevel:  extProcLogLevel,
-		standAlone:       standAlone,
-		uuidFn:           uf,
-		extProcAsSideCar: extProcAsSideCar,
+		client:                client,
+		kube:                  kube,
+		logger:                logger,
+		envoyGatewayNamespace: envoyGatewayNamespace,
+		extProcImage:          extProcImage,
+		extProcLogLevel:       extProcLogLevel,
+		standAlone:            standAlone,
+		uuidFn:                uf,
+		extProcAsSideCar:      extProcAsSideCar,
 	}
 }
 
 // GatewayController implements reconcile.TypedReconciler for gwapiv1.Gateway.
 type GatewayController struct {
-	client          client.Client
-	kube            kubernetes.Interface
-	logger          logr.Logger
-	extProcImage    string // The image of the external processor sidecar container.
-	extProcLogLevel string // The log level for the extproc container.
+	client                client.Client
+	kube                  kubernetes.Interface
+	logger                logr.Logger
+	envoyGatewayNamespace string // The namespace where Envoy Gateway is deployed.
+	extProcImage          string // The image of the external processor sidecar container.
+	extProcLogLevel       string // The log level for the extproc container.
 	// standAlone indicates whether the controller is running in standalone mode.
 	standAlone bool
 	uuidFn     func() string // Function to generate a new UUID for the filter config.
@@ -425,6 +427,7 @@ func (c *GatewayController) reconcileFilterConfigSecret(
 				b.ModelNameOverride = backendRef.ModelNameOverride
 
 				var bsp *aigv1b1.BackendSecurityPolicy
+				var aiServiceBackend *aigv1b1.AIServiceBackend
 				backendNamespace := backendRef.GetNamespace(aiGatewayRoute.Namespace)
 
 				if backendRef.IsInferencePool() {
@@ -445,6 +448,7 @@ func (c *GatewayController) reconcileFilterConfigSecret(
 				} else {
 					var backendObj *aigv1b1.AIServiceBackend
 					backendObj, bsp, err = c.backendWithMaybeBSP(ctx, backendNamespace, backendRef.Name)
+					aiServiceBackend = backendObj
 					if err != nil {
 						c.logger.Error(err, "failed to get backend or backend security policy. Skipping this backend.",
 							"backend_name", backendRef.Name, "aigatewayroute", aiGatewayRoute.Name,
@@ -472,7 +476,7 @@ func (c *GatewayController) reconcileFilterConfigSecret(
 				}
 
 				if bsp != nil {
-					b.Auth, err = c.bspToFilterAPIBackendAuth(ctx, bsp)
+					b.Auth, err = c.bspToFilterAPIBackendAuth(ctx, bsp, aiServiceBackend)
 					if err != nil {
 						c.logger.Error(err, "failed to get backend auth from backend security policy. Skipping this backend.",
 							"backend_name", backendRef.Name, "backend_security_policy", bsp.Name,
@@ -668,7 +672,7 @@ func mcpConfig(mcpRoutes []aigv1b1.MCPRoute) (_ *filterapi.MCPConfig, hasEffecti
 	return mc, hasEffectiveRoute
 }
 
-func (c *GatewayController) bspToFilterAPIBackendAuth(ctx context.Context, backendSecurityPolicy *aigv1b1.BackendSecurityPolicy) (*filterapi.BackendAuth, error) {
+func (c *GatewayController) bspToFilterAPIBackendAuth(ctx context.Context, backendSecurityPolicy *aigv1b1.BackendSecurityPolicy, aiServiceBackend *aigv1b1.AIServiceBackend) (*filterapi.BackendAuth, error) {
 	namespace := backendSecurityPolicy.Namespace
 	switch backendSecurityPolicy.Spec.Type {
 	case aigv1b1.BackendSecurityPolicyTypeAPIKey:
@@ -694,13 +698,33 @@ func (c *GatewayController) bspToFilterAPIBackendAuth(ctx context.Context, backe
 		return &filterapi.BackendAuth{AnthropicAPIKey: &filterapi.AnthropicAPIKeyAuth{Key: apiKey}}, nil
 	case aigv1b1.BackendSecurityPolicyTypeAWSCredentials:
 		awsCred := backendSecurityPolicy.Spec.AWSCredentials
+		if awsCred == nil {
+			return nil, fmt.Errorf("AWSCredentials is nil for BackendSecurityPolicy %s", backendSecurityPolicy.Name)
+		}
+		service := ""
+		signingHost := ""
+		if awsCred.Service != nil {
+			service = *awsCred.Service
+		}
+		if awsCred.SigningHost != nil {
+			signingHost = *awsCred.SigningHost
+		}
+		if signingHost == "" && aiServiceBackend != nil {
+			host, err := c.resolveBackendFQDNHostname(ctx, namespace, aiServiceBackend.Spec.BackendRef)
+			if err != nil {
+				return nil, fmt.Errorf("failed to resolve AWS signing host for BackendSecurityPolicy %s: %w", backendSecurityPolicy.Name, err)
+			}
+			signingHost = host
+		}
 
 		// If no credentials file or OIDC token is configured, use default credential chain
 		// This allows IRSA/Pod Identity to work automatically
 		if awsCred.CredentialsFile == nil && awsCred.OIDCExchangeToken == nil {
 			return &filterapi.BackendAuth{
 				AWSAuth: &filterapi.AWSAuth{
-					Region: awsCred.Region,
+					Region:      awsCred.Region,
+					Service:     service,
+					SigningHost: signingHost,
 				},
 			}, nil
 		}
@@ -720,6 +744,8 @@ func (c *GatewayController) bspToFilterAPIBackendAuth(ctx context.Context, backe
 			AWSAuth: &filterapi.AWSAuth{
 				CredentialFileLiteral: credentialsLiteral,
 				Region:                awsCred.Region,
+				Service:               service,
+				SigningHost:           signingHost,
 			},
 		}, nil
 	case aigv1b1.BackendSecurityPolicyTypeAzureCredentials:
@@ -869,6 +895,35 @@ func (c *GatewayController) injectQuotaPolicyCostExpressions(
 // is active per request, and ext_proc filters cost entries by Model before
 // writing to this key.
 const QuotaCostMetadataKey = "quota_cost"
+
+// resolveBackendFQDNHostname returns the upstream hostname from an Envoy Gateway Backend resource.
+// SigV4 signs over the host AWS ultimately sees; Envoy rewrites :authority to this hostname on
+// the upstream request, so the extproc signer must use the same value from config, not the
+// client-facing :authority visible at signing time.
+func (c *GatewayController) resolveBackendFQDNHostname(ctx context.Context, namespace string, ref gwapiv1.BackendObjectReference) (string, error) {
+	backendNamespace := namespace
+	if ref.Namespace != nil {
+		backendNamespace = string(*ref.Namespace)
+	}
+	backendName := string(ref.Name)
+
+	var backend egv1a1.Backend
+	if err := c.client.Get(ctx, client.ObjectKey{Name: backendName, Namespace: backendNamespace}, &backend); err != nil {
+		return "", fmt.Errorf("failed to get Backend %s/%s: %w", backendNamespace, backendName, err)
+	}
+
+	for i := range backend.Spec.Endpoints {
+		ep := &backend.Spec.Endpoints[i]
+		if ep.FQDN != nil && ep.FQDN.Hostname != "" {
+			return ep.FQDN.Hostname, nil
+		}
+		if ep.Hostname != nil && *ep.Hostname != "" {
+			return *ep.Hostname, nil
+		}
+	}
+
+	return "", fmt.Errorf("Backend %s/%s has no FQDN/hostname endpoint", backendNamespace, backendName)
+}
 
 // backendWithMaybeBSP retrieves the AIServiceBackend and its associated BackendSecurityPolicy if it exists.
 func (c *GatewayController) backendWithMaybeBSP(ctx context.Context, namespace, name string) (backend *aigv1b1.AIServiceBackend, bsp *aigv1b1.BackendSecurityPolicy, err error) {
@@ -1145,32 +1200,45 @@ func (c *GatewayController) getObjectsForGateway(ctx context.Context, gw *gwapiv
 	listOption := metav1.ListOptions{LabelSelector: fmt.Sprintf(
 		"%s=%s,%s=%s", egOwningGatewayNameLabel, gw.Name, egOwningGatewayNamespaceLabel, gw.Namespace,
 	)}
-	var ps *corev1.PodList
-	ps, err = c.kube.CoreV1().Pods("").List(ctx, listOption)
-	if err != nil {
-		err = fmt.Errorf("failed to list pods: %w", err)
+
+	var distinctNamespaces []string
+	for _, ns := range []string{gw.Namespace, c.envoyGatewayNamespace} {
+		var ps *corev1.PodList
+		ps, err = c.kube.CoreV1().Pods(ns).List(ctx, listOption)
+		if err != nil {
+			err = fmt.Errorf("failed to list pods in namespace %s: %w", ns, err)
+			return
+		}
+		pods = append(pods, ps.Items...)
+
+		var ds *appsv1.DeploymentList
+		ds, err = c.kube.AppsV1().Deployments(ns).List(ctx, listOption)
+		if err != nil {
+			err = fmt.Errorf("failed to list deployments in namespace %s: %w", ns, err)
+			return
+		}
+		deployments = append(deployments, ds.Items...)
+
+		var dss *appsv1.DaemonSetList
+		dss, err = c.kube.AppsV1().DaemonSets(ns).List(ctx, listOption)
+		if err != nil {
+			err = fmt.Errorf("failed to list daemonsets in namespace %s: %w", ns, err)
+			return
+		}
+		daemonSets = append(daemonSets, dss.Items...)
+
+		if len(ps.Items) > 0 || len(ds.Items) > 0 || len(dss.Items) > 0 {
+			distinctNamespaces = append(distinctNamespaces, ns)
+		}
+	}
+
+	// All pods, deployments, and daemonsets should be in the same namespace.
+	// Otherwise, it would be a bug in the EG or the disruptive configuration change of EG.
+	if len(distinctNamespaces) > 1 {
+		err = fmt.Errorf("found gateway-labeled objects in multiple namespaces: %v", distinctNamespaces)
 		return
 	}
-	pods = ps.Items
 
-	var ds *appsv1.DeploymentList
-	ds, err = c.kube.AppsV1().Deployments("").List(ctx, listOption)
-	if err != nil {
-		err = fmt.Errorf("failed to list deployments: %w", err)
-		return
-	}
-	deployments = ds.Items
-
-	var dss *appsv1.DaemonSetList
-	dss, err = c.kube.AppsV1().DaemonSets("").List(ctx, listOption)
-	if err != nil {
-		err = fmt.Errorf("failed to list daemonsets: %w", err)
-		return
-	}
-	daemonSets = dss.Items
-
-	// We assume that all pods, deployments, and daemonsets are in the same namespace. Otherwise, it would be a bug in the EG
-	// or the disruptive configuration change of EG.
 	if len(pods) > 0 {
 		namespace = pods[0].Namespace
 	}
