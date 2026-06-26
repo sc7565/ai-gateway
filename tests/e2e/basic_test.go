@@ -21,6 +21,7 @@ import (
 	coherev2client "github.com/cohere-ai/cohere-go/v2/v2"
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
+	"github.com/openai/openai-go/responses"
 	"github.com/stretchr/testify/require"
 
 	internaltesting "github.com/envoyproxy/ai-gateway/internal/testing"
@@ -157,6 +158,91 @@ func Test_Examples_Basic(t *testing.T) {
 				}
 				if err = stream.Err(); err != nil {
 					return fmt.Errorf("stream error: %w", err)
+				}
+				if !nonEmptyResponse {
+					return errors.New("no non-empty response received")
+				}
+				return nil
+			}, 20*time.Second, 3*time.Second)
+		})
+
+		// Test Anthropic Messages API (/v1/messages) translated to AWS Bedrock Converse API.
+		// This reuses the existing AWSBedrock route for us.meta.llama3-2-1b-instruct-v1:0 from aws.yaml.
+		t.Run("aws_bedrock_anthropic_messages", func(t *testing.T) {
+			cc.MaybeSkip(t, internaltesting.RequiredCredentialAWS)
+			internaltesting.RequireEventuallyNoError(t, func() error {
+				fwd := e2elib.RequireNewHTTPPortForwarder(t, e2elib.EnvoyGatewayNamespace, egSelector, e2elib.EnvoyGatewayDefaultServicePort)
+				defer fwd.Kill()
+
+				ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+				defer cancel()
+
+				client := anthropic.NewClient(
+					anthropicoption.WithAPIKey("dummy"),
+					anthropicoption.WithBaseURL(fwd.Address()+"/anthropic/"),
+				)
+
+				msg, err := client.Messages.New(ctx, anthropic.MessageNewParams{
+					Model:     "us.meta.llama3-2-1b-instruct-v1:0",
+					MaxTokens: 256,
+					Messages: []anthropic.MessageParam{
+						anthropic.NewUserMessage(anthropic.NewTextBlock("Say this is a test.")),
+					},
+				})
+				if err != nil {
+					return fmt.Errorf("anthropic messages to aws bedrock error: %w", err)
+				}
+				nonEmptyResponse := false
+				for _, block := range msg.Content {
+					if textBlock, ok := block.AsAny().(anthropic.TextBlock); ok {
+						if textBlock.Text != "" {
+							nonEmptyResponse = true
+							t.Logf("received text: %s", textBlock.Text)
+						}
+					}
+				}
+				if !nonEmptyResponse {
+					return errors.New("no non-empty response received")
+				}
+				return nil
+			}, 20*time.Second, 3*time.Second)
+		})
+
+		// Test Responses API (/v1/responses) translated to AWS Bedrock Converse API.
+		// This reuses the existing AWSBedrock route for us.meta.llama3-2-1b-instruct-v1:0 from aws.yaml.
+		t.Run("aws_bedrock_responses", func(t *testing.T) {
+			cc.MaybeSkip(t, internaltesting.RequiredCredentialAWS)
+			internaltesting.RequireEventuallyNoError(t, func() error {
+				fwd := e2elib.RequireNewHTTPPortForwarder(t, e2elib.EnvoyGatewayNamespace, egSelector, e2elib.EnvoyGatewayDefaultServicePort)
+				defer fwd.Kill()
+
+				ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+				defer cancel()
+
+				client := openai.NewClient(option.WithBaseURL(fwd.Address() + "/v1/"))
+
+				resp, err := client.Responses.New(ctx, responses.ResponseNewParams{
+					Model: "us.meta.llama3-2-1b-instruct-v1:0",
+					Input: responses.ResponseNewParamsInputUnion{
+						OfString: openai.String("Say this is a test."),
+					},
+				})
+				if err != nil {
+					return fmt.Errorf("responses to aws bedrock error: %w", err)
+				}
+				if len(resp.Output) == 0 {
+					return errors.New("no output items in response")
+				}
+				nonEmptyResponse := false
+				for _, item := range resp.Output {
+					if item.Type == "message" {
+						for _, content := range item.Content {
+							if content.Type == "output_text" && content.Text != "" {
+								nonEmptyResponse = true
+								t.Logf("received text: %s", content.Text)
+							}
+						}
+					}
 				}
 				if !nonEmptyResponse {
 					return errors.New("no non-empty response received")

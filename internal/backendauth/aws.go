@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -29,6 +30,8 @@ type awsHandler struct {
 	credentialsProvider aws.CredentialsProvider
 	signer              *v4.Signer
 	region              string
+	service             string
+	signingHost         string
 }
 
 func newAWSHandler(ctx context.Context, awsAuth *filterapi.AWSAuth) (filterapi.BackendAuthHandler, error) {
@@ -75,16 +78,38 @@ func newAWSHandler(ctx context.Context, awsAuth *filterapi.AWSAuth) (filterapi.B
 
 	signer := v4.NewSigner()
 
-	return &awsHandler{credentialsProvider: cfg.Credentials, signer: signer, region: awsAuth.Region}, nil
+	return &awsHandler{
+		credentialsProvider: cfg.Credentials,
+		signer:              signer,
+		region:              awsAuth.Region,
+		service:             awsAuth.Service,
+		signingHost:         awsAuth.SigningHost,
+	}, nil
 }
 
 // Do implements [Handler.Do].
 //
 // This assumes that during the transformation, the path is set in the header mutation as well as
 // the body in the body mutation.
+//
+// Supports per-request AWS credentials via headers for cost attribution:
+// - x-aws-access-key-id: AWS access key ID
+// - x-aws-secret-access-key: AWS secret access key
+// - x-aws-session-token: AWS session token (for temporary credentials)
+//
+// If these headers are present, they will be used instead of the default AWS credential chain.
+// This enables per-user cost attribution when used with STS AssumeRole session tags.
+// Works with any platform (EKS/IRSA, EC2 instance roles, ECS task roles, Lambda, etc.).
 func (a *awsHandler) Do(ctx context.Context, requestHeaders map[string]string, mutatedBody []byte) ([]internalapi.Header, error) {
 	method := requestHeaders[":method"]
 	path := requestHeaders[":path"]
+
+	host := resolveAWSSigningHost(a.signingHost, a.region)
+
+	service := a.service
+	if service == "" {
+		service = inferAWSServiceFromHost(host)
+	}
 
 	var body []byte
 	if len(mutatedBody) > 0 {
@@ -93,7 +118,7 @@ func (a *awsHandler) Do(ctx context.Context, requestHeaders map[string]string, m
 
 	payloadHash := sha256.Sum256(body)
 	req, err := http.NewRequest(method,
-		fmt.Sprintf("https://bedrock-runtime.%s.amazonaws.com%s", a.region, path),
+		fmt.Sprintf("https://%s%s", host, path),
 		bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("cannot create request: %w", err)
@@ -107,13 +132,41 @@ func (a *awsHandler) Do(ctx context.Context, requestHeaders map[string]string, m
 	// https://github.com/envoyproxy/envoy/blob/60b2b5187cf99db79ecfc54675354997af4765ea/source/extensions/filters/http/ext_proc/processor_state.cc#L180-L183
 	req.ContentLength = -1
 
-	credentials, err := a.credentialsProvider.Retrieve(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("cannot retrieve AWS credentials: %w", err)
+	var credentials aws.Credentials
+
+	// Check for per-request credentials from headers (for cost attribution)
+	accessKeyID := requestHeaders["x-aws-access-key-id"]
+	secretAccessKey := requestHeaders["x-aws-secret-access-key"]
+	sessionToken := requestHeaders["x-aws-session-token"]
+
+	if accessKeyID != "" && secretAccessKey != "" {
+		// Use per-request credentials from headers (typically from ext-auth service)
+		credentials = aws.Credentials{
+			AccessKeyID:     accessKeyID,
+			SecretAccessKey: secretAccessKey,
+			SessionToken:    sessionToken,
+			Source:          "RequestHeaders",
+		}
+
+		// Remove credential headers to prevent leakage to downstream services
+		delete(requestHeaders, "x-aws-access-key-id")
+		delete(requestHeaders, "x-aws-secret-access-key")
+		delete(requestHeaders, "x-aws-session-token")
+	} else if accessKeyID != "" || secretAccessKey != "" {
+		// Partial credentials provided - this is an error
+		return nil, fmt.Errorf("incomplete AWS credentials in headers: both x-aws-access-key-id and x-aws-secret-access-key are required")
+	} else {
+		// Fall back to default AWS credential chain
+		// Supports: IRSA, EKS Pod Identity, EC2 instance roles, ECS task roles,
+		// Lambda execution roles, environment variables, shared credentials file, etc.
+		credentials, err = a.credentialsProvider.Retrieve(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("cannot retrieve AWS credentials: %w", err)
+		}
 	}
 
 	err = a.signer.SignHTTP(ctx, credentials, req,
-		hex.EncodeToString(payloadHash[:]), "bedrock", a.region, time.Now())
+		hex.EncodeToString(payloadHash[:]), service, a.region, time.Now())
 	if err != nil {
 		return nil, fmt.Errorf("cannot sign request: %w", err)
 	}
@@ -126,4 +179,38 @@ func (a *awsHandler) Do(ctx context.Context, requestHeaders map[string]string, m
 		}
 	}
 	return headers, nil
+}
+
+func inferAWSServiceFromHost(host string) string {
+	h := host
+	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		h = parsedHost
+	}
+
+	if h == "" || h == "localhost" {
+		return "bedrock"
+	}
+
+	// Fall back to "bedrock" for bare IP addresses (v4 or v6).
+	if net.ParseIP(h) != nil {
+		return "bedrock"
+	}
+
+	if strings.HasPrefix(h, "bedrock-runtime.") || strings.HasPrefix(h, "bedrock-mantle.") || strings.HasPrefix(h, "bedrock.") {
+		return "bedrock"
+	}
+
+	parts := strings.SplitN(h, ".", 2)
+	if len(parts) > 0 && parts[0] != "" {
+		return parts[0]
+	}
+
+	return "bedrock"
+}
+
+func resolveAWSSigningHost(explicitSigningHost, region string) string {
+	if explicitSigningHost != "" {
+		return explicitSigningHost
+	}
+	return fmt.Sprintf("bedrock-runtime.%s.amazonaws.com", region)
 }

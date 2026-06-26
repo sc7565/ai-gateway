@@ -36,6 +36,8 @@ func TestNewAWSHandler(t *testing.T) {
 		awsH, ok := handler.(*awsHandler)
 		require.True(t, ok)
 		require.Equal(t, "us-east-1", awsH.region)
+		require.Empty(t, awsH.service)
+		require.Empty(t, awsH.signingHost)
 		require.NotNil(t, awsH.credentialsProvider)
 		require.NotNil(t, awsH.signer)
 	})
@@ -62,6 +64,8 @@ func TestNewAWSHandler(t *testing.T) {
 		awsH, ok := handler.(*awsHandler)
 		require.True(t, ok)
 		require.Equal(t, "us-west-2", awsH.region)
+		require.Empty(t, awsH.service)
+		require.Empty(t, awsH.signingHost)
 
 		// Verify credentials can be retrieved from environment
 		creds, err := awsH.credentialsProvider.Retrieve(t.Context())
@@ -101,6 +105,22 @@ func TestNewAWSHandler(t *testing.T) {
 		require.Nil(t, handler)
 		require.Contains(t, err.Error(), "aws auth configuration is required")
 	})
+
+	t.Run("explicit service and signing host", func(t *testing.T) {
+		awsFileBody := "[default]\naws_access_key_id=test\naws_secret_access_key=secret\n"
+		handler, err := newAWSHandler(t.Context(), &filterapi.AWSAuth{
+			CredentialFileLiteral: awsFileBody,
+			Region:                "us-east-1",
+			Service:               "bedrock",
+			SigningHost:           "bedrock-mantle.us-east-1.api.aws",
+		})
+		require.NoError(t, err)
+
+		awsH, ok := handler.(*awsHandler)
+		require.True(t, ok)
+		require.Equal(t, "bedrock", awsH.service)
+		require.Equal(t, "bedrock-mantle.us-east-1.api.aws", awsH.signingHost)
+	})
 }
 
 func TestAWSHandler_Do(t *testing.T) {
@@ -118,12 +138,17 @@ func TestAWSHandler_Do(t *testing.T) {
 		for range 100 {
 			go func() {
 				defer wg.Done()
-				hdrs, err := handler.Do(t.Context(), map[string]string{":method": "POST", ":path": "/model/some-random-model/converse"}, []byte(`{"messages": [{"role": "user", "content": [{"text": "Say this is a test!"}]}]}`))
+				hdrs, err := handler.Do(t.Context(), map[string]string{
+					":method":    "POST",
+					":path":      "/model/some-random-model/converse",
+					":authority": "bedrock-runtime.us-east-1.amazonaws.com",
+				}, []byte(`{"messages": [{"role": "user", "content": [{"text": "Say this is a test!"}]}]}`))
 				require.NoError(t, err)
 
 				headers := stringPairsToMap(hdrs)
 				require.Contains(t, headers, "X-Amz-Date")
 				require.Contains(t, headers, "Authorization")
+				require.Contains(t, headers["Authorization"], "/bedrock/")
 			}()
 		}
 		wg.Wait()
@@ -141,7 +166,7 @@ func TestAWSHandler_Do(t *testing.T) {
 		require.NoError(t, err)
 
 		hdrs, err := handler.Do(t.Context(), map[string]string{
-			":method": "POST", ":path": "/model/amazon.titan-text-express-v1/invoke",
+			":method": "POST", ":path": "/model/amazon.titan-text-express-v1/invoke", ":authority": "bedrock-runtime.us-east-1.amazonaws.com",
 		}, []byte(`{"inputText": "Hello from default chain"}`))
 		require.NoError(t, err)
 
@@ -164,7 +189,7 @@ func TestAWSHandler_Do(t *testing.T) {
 		require.NoError(t, err)
 
 		hdrs, err := handler.Do(t.Context(), map[string]string{
-			":method": "POST", ":path": "/model/anthropic.claude-v2/converse",
+			":method": "POST", ":path": "/model/anthropic.claude-v2/converse", ":authority": "bedrock-runtime.eu-central-1.amazonaws.com",
 		}, []byte(`{"inputText": "Hello from default chain"}`))
 		require.NoError(t, err)
 
@@ -186,7 +211,7 @@ func TestAWSHandler_Do(t *testing.T) {
 		methods := []string{"POST", "GET", "PUT"}
 		for _, method := range methods {
 			hdrs, err := handler.Do(t.Context(), map[string]string{
-				":method": method, ":path": "/model/test-model/invoke",
+				":method": method, ":path": "/model/test-model/invoke", ":authority": "bedrock-runtime.us-east-1.amazonaws.com",
 			}, []byte(`{"test": "data"}`))
 			require.NoError(t, err)
 
@@ -204,7 +229,7 @@ func TestAWSHandler_Do(t *testing.T) {
 		require.NoError(t, err)
 
 		hdrs, err := handler.Do(t.Context(), map[string]string{
-			":method": "GET", ":path": "/model/test-model/invoke",
+			":method": "GET", ":path": "/model/test-model/invoke", ":authority": "bedrock-runtime.ap-northeast-1.amazonaws.com",
 		}, nil)
 		require.NoError(t, err)
 
@@ -225,9 +250,344 @@ func TestAWSHandler_Do(t *testing.T) {
 			require.NoError(t, err)
 
 			_, err = handler.Do(t.Context(), map[string]string{
-				":method": "POST", ":path": "/model/test/converse",
+				":method": "POST", ":path": "/model/test/converse", ":authority": "bedrock-runtime." + region + ".amazonaws.com",
 			}, nil)
 			require.NoError(t, err, "Failed for region: %s", region)
 		}
 	})
+
+	t.Run("per-request credentials from headers", func(t *testing.T) {
+		// Set up handler with default IRSA credentials
+		t.Setenv("AWS_ACCESS_KEY_ID", "AKIADEFAULTKEY")
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "default-secret-key")
+
+		handler, err := newAWSHandler(t.Context(), &filterapi.AWSAuth{
+			Region: "us-east-1",
+		})
+		require.NoError(t, err)
+
+		// Test with per-request credentials that should override IRSA
+		requestHeaders := map[string]string{
+			":method":                 "POST",
+			":path":                   "/model/anthropic.claude-v2/converse",
+			"x-aws-access-key-id":     "ASIAPERUSERKEY",
+			"x-aws-secret-access-key": "per-user-secret-key",
+			"x-aws-session-token":     "per-user-session-token-xyz",
+		}
+
+		hdrs, err := handler.Do(t.Context(), requestHeaders, []byte(`{"messages": [{"role": "user", "content": "test"}]}`))
+		require.NoError(t, err)
+
+		headers := stringPairsToMap(hdrs)
+		require.Contains(t, headers, "Authorization")
+		require.Contains(t, headers, "X-Amz-Date")
+		require.Contains(t, headers, "X-Amz-Security-Token")
+
+		// Verify the per-request credentials were used (not the default ones)
+		require.Contains(t, headers["Authorization"], "Credential=ASIAPERUSERKEY")
+		require.Equal(t, "per-user-session-token-xyz", headers["X-Amz-Security-Token"])
+
+		// Verify credential headers were removed from requestHeaders map
+		require.NotContains(t, requestHeaders, "x-aws-access-key-id")
+		require.NotContains(t, requestHeaders, "x-aws-secret-access-key")
+		require.NotContains(t, requestHeaders, "x-aws-session-token")
+	})
+
+	t.Run("per-request credentials without session token", func(t *testing.T) {
+		// Test with permanent credentials (no session token)
+		t.Setenv("AWS_ACCESS_KEY_ID", "AKIADEFAULTKEY")
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "default-secret-key")
+
+		handler, err := newAWSHandler(t.Context(), &filterapi.AWSAuth{
+			Region: "eu-central-1",
+		})
+		require.NoError(t, err)
+
+		requestHeaders := map[string]string{
+			":method":                 "POST",
+			":path":                   "/model/test/invoke",
+			"x-aws-access-key-id":     "AKIAPERUSERKEY",
+			"x-aws-secret-access-key": "per-user-secret",
+		}
+
+		hdrs, err := handler.Do(t.Context(), requestHeaders, nil)
+		require.NoError(t, err)
+
+		headers := stringPairsToMap(hdrs)
+		require.Contains(t, headers, "Authorization")
+		require.Contains(t, headers["Authorization"], "Credential=AKIAPERUSERKEY")
+		// Should NOT have session token header when not provided
+		require.NotContains(t, headers, "X-Amz-Security-Token")
+	})
+
+	t.Run("incomplete per-request credentials - only access key", func(t *testing.T) {
+		t.Setenv("AWS_ACCESS_KEY_ID", "AKIADEFAULTKEY")
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "default-secret-key")
+
+		handler, err := newAWSHandler(t.Context(), &filterapi.AWSAuth{
+			Region: "us-west-2",
+		})
+		require.NoError(t, err)
+
+		requestHeaders := map[string]string{
+			":method":             "POST",
+			":path":               "/model/test/invoke",
+			"x-aws-access-key-id": "ASIAPERUSERKEY",
+			// Missing x-aws-secret-access-key
+		}
+
+		_, err = handler.Do(t.Context(), requestHeaders, nil)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "incomplete AWS credentials in headers")
+	})
+
+	t.Run("incomplete per-request credentials - only secret key", func(t *testing.T) {
+		t.Setenv("AWS_ACCESS_KEY_ID", "AKIADEFAULTKEY")
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "default-secret-key")
+
+		handler, err := newAWSHandler(t.Context(), &filterapi.AWSAuth{
+			Region: "us-west-2",
+		})
+		require.NoError(t, err)
+
+		requestHeaders := map[string]string{
+			":method":                 "POST",
+			":path":                   "/model/test/invoke",
+			"x-aws-secret-access-key": "per-user-secret",
+			// Missing x-aws-access-key-id
+		}
+
+		_, err = handler.Do(t.Context(), requestHeaders, nil)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "incomplete AWS credentials in headers")
+	})
+
+	t.Run("fallback to IRSA when no header credentials", func(t *testing.T) {
+		// Verify backward compatibility - when no header credentials, use IRSA
+		t.Setenv("AWS_ACCESS_KEY_ID", "AKIADEFAULTKEY")
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "default-secret-key")
+		t.Setenv("AWS_SESSION_TOKEN", "default-session-token")
+
+		handler, err := newAWSHandler(t.Context(), &filterapi.AWSAuth{
+			Region: "ap-southeast-1",
+		})
+		require.NoError(t, err)
+
+		requestHeaders := map[string]string{
+			":method": "POST",
+			":path":   "/model/test/invoke",
+			// No x-aws-* headers
+		}
+
+		hdrs, err := handler.Do(t.Context(), requestHeaders, nil)
+		require.NoError(t, err)
+
+		headers := stringPairsToMap(hdrs)
+		require.Contains(t, headers, "Authorization")
+		// Should use default/IRSA credentials
+		require.Contains(t, headers["Authorization"], "Credential=AKIADEFAULTKEY")
+		require.Equal(t, "default-session-token", headers["X-Amz-Security-Token"])
+	})
+
+	t.Run("concurrent requests with mixed credential sources", func(t *testing.T) {
+		// Test thread safety with both IRSA and per-request credentials
+		t.Setenv("AWS_ACCESS_KEY_ID", "AKIADEFAULTKEY")
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "default-secret-key")
+
+		handler, err := newAWSHandler(t.Context(), &filterapi.AWSAuth{
+			Region: "us-east-1",
+		})
+		require.NoError(t, err)
+
+		var wg sync.WaitGroup
+		wg.Add(100)
+
+		for i := range 100 {
+			go func(idx int) {
+				defer wg.Done()
+
+				var headers map[string]string
+				if idx%2 == 0 {
+					// Even requests use per-request credentials
+					headers = map[string]string{
+						":method":                 "POST",
+						":path":                   "/model/test/converse",
+						"x-aws-access-key-id":     "ASIAPERUSERKEY",
+						"x-aws-secret-access-key": "per-user-secret",
+						"x-aws-session-token":     "per-user-token",
+					}
+				} else {
+					// Odd requests use IRSA
+					headers = map[string]string{
+						":method": "POST",
+						":path":   "/model/test/converse",
+					}
+				}
+
+				hdrs, err := handler.Do(t.Context(), headers, []byte(`{"test": "data"}`))
+				require.NoError(t, err)
+				headerMap := stringPairsToMap(hdrs)
+				require.Contains(t, headerMap, "Authorization")
+
+				if idx%2 == 0 {
+					// Verify per-request creds were used
+					require.Contains(t, headerMap["Authorization"], "Credential=ASIAPERUSERKEY")
+				} else {
+					// Verify IRSA creds were used
+					require.Contains(t, headerMap["Authorization"], "Credential=AKIADEFAULTKEY")
+				}
+			}(i)
+		}
+		wg.Wait()
+	})
+
+	t.Run("mantle signing host infers bedrock service", func(t *testing.T) {
+		awsFileBody := "[default]\naws_access_key_id=test\naws_secret_access_key=secret\n"
+		handler, err := newAWSHandler(t.Context(), &filterapi.AWSAuth{
+			CredentialFileLiteral: awsFileBody,
+			Region:                "us-east-2",
+			SigningHost:           "bedrock-mantle.us-east-2.api.aws",
+		})
+		require.NoError(t, err)
+
+		hdrs, err := handler.Do(t.Context(), map[string]string{
+			":method": "POST",
+			":path":   "/openai/v1/responses",
+		}, []byte(`{"model": "gpt-5.4"}`))
+		require.NoError(t, err)
+
+		headers := stringPairsToMap(hdrs)
+		require.Contains(t, headers["Authorization"], "/bedrock/")
+	})
+
+	t.Run("explicit service override wins", func(t *testing.T) {
+		awsFileBody := "[default]\naws_access_key_id=test\naws_secret_access_key=secret\n"
+		handler, err := newAWSHandler(t.Context(), &filterapi.AWSAuth{
+			CredentialFileLiteral: awsFileBody,
+			Region:                "us-east-2",
+			Service:               "bedrock-agentcore",
+			SigningHost:           "bedrock-mantle.us-east-2.api.aws",
+		})
+		require.NoError(t, err)
+
+		hdrs, err := handler.Do(t.Context(), map[string]string{
+			":method": "POST",
+			":path":   "/openai/v1/responses",
+		}, []byte(`{"model": "gpt-5.4"}`))
+		require.NoError(t, err)
+
+		headers := stringPairsToMap(hdrs)
+		require.Contains(t, headers["Authorization"], "/bedrock-agentcore/")
+	})
+
+	t.Run("mantle with per-request STS credentials", func(t *testing.T) {
+		t.Setenv("AWS_ACCESS_KEY_ID", "AKIADEFAULTKEY")
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "default-secret-key")
+
+		handler, err := newAWSHandler(t.Context(), &filterapi.AWSAuth{
+			Region:      "us-east-1",
+			SigningHost: "bedrock-mantle.us-east-1.api.aws",
+		})
+		require.NoError(t, err)
+
+		requestHeaders := map[string]string{
+			":method":                 "POST",
+			":path":                   "/openai/v1/responses",
+			"x-aws-access-key-id":     "ASIAPERUSERKEY",
+			"x-aws-secret-access-key": "per-user-secret-key",
+			"x-aws-session-token":     "per-user-session-token",
+		}
+
+		hdrs, err := handler.Do(t.Context(), requestHeaders, []byte(`{"model":"openai.gpt-5.5","input":"hi"}`))
+		require.NoError(t, err)
+
+		headers := stringPairsToMap(hdrs)
+		require.Contains(t, headers["Authorization"], "Credential=ASIAPERUSERKEY")
+		require.Contains(t, headers["Authorization"], "/bedrock/")
+		require.Contains(t, headers["Authorization"], "us-east-1")
+		require.Equal(t, "per-user-session-token", headers["X-Amz-Security-Token"])
+		require.NotContains(t, requestHeaders, "x-aws-access-key-id")
+	})
+
+	t.Run("controller signing host ignores client-facing authority", func(t *testing.T) {
+		awsFileBody := "[default]\naws_access_key_id=test\naws_secret_access_key=secret\n"
+		handler, err := newAWSHandler(t.Context(), &filterapi.AWSAuth{
+			CredentialFileLiteral: awsFileBody,
+			Region:                "us-west-2",
+			SigningHost:           "bedrock-runtime.us-west-2.amazonaws.com",
+		})
+		require.NoError(t, err)
+
+		hdrs, err := handler.Do(t.Context(), map[string]string{
+			":method":    "POST",
+			":path":      "/model/global.anthropic.claude-haiku-4-5-20251001-v1:0/invoke",
+			":authority": "ai-gateway.tools.stg.uw2.aws.zuora",
+		}, []byte(`{"anthropic_version":"bedrock-2023-05-31","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`))
+		require.NoError(t, err)
+
+		headers := stringPairsToMap(hdrs)
+		require.Contains(t, headers["Authorization"], "/bedrock/")
+		require.Contains(t, headers["Authorization"], "/us-west-2/")
+		require.NotContains(t, headers["Authorization"], "/ai-gateway/")
+	})
+}
+
+func TestInferAWSServiceFromHost(t *testing.T) {
+	tests := []struct {
+		name string
+		host string
+		want string
+	}{
+		{name: "bedrock runtime", host: "bedrock-runtime.us-east-1.amazonaws.com", want: "bedrock"},
+		{name: "bedrock mantle", host: "bedrock-mantle.us-east-2.api.aws", want: "bedrock"},
+		{name: "bedrock bare", host: "bedrock.us-west-2.amazonaws.com", want: "bedrock"},
+		{name: "host with port", host: "bedrock-mantle.us-east-2.api.aws:443", want: "bedrock"},
+		{name: "unknown aws", host: "execute-api.us-east-1.amazonaws.com", want: "execute-api"},
+		{name: "empty", host: "", want: "bedrock"},
+		{name: "localhost", host: "localhost", want: "bedrock"},
+		{name: "localhost with port", host: "localhost:8080", want: "bedrock"},
+		{name: "ipv4 address", host: "192.168.1.1", want: "bedrock"},
+		{name: "ipv4 address with port", host: "192.168.1.1:8080", want: "bedrock"},
+		{name: "ipv6 address", host: "::1", want: "bedrock"},
+		{name: "ipv6 address with port", host: "[::1]:8080", want: "bedrock"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, inferAWSServiceFromHost(tt.host))
+		})
+	}
+}
+
+func TestResolveAWSSigningHost(t *testing.T) {
+	tests := []struct {
+		name                string
+		explicitSigningHost string
+		region              string
+		want                string
+	}{
+		{
+			name:                "explicit signing host wins",
+			explicitSigningHost: "bedrock-mantle.us-east-1.api.aws",
+			region:              "us-east-1",
+			want:                "bedrock-mantle.us-east-1.api.aws",
+		},
+		{
+			name:   "empty signing host falls back to runtime host",
+			region: "us-east-1",
+			want:   "bedrock-runtime.us-east-1.amazonaws.com",
+		},
+		{
+			name:   "region preserved in runtime fallback",
+			region: "us-west-2",
+			want:   "bedrock-runtime.us-west-2.amazonaws.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveAWSSigningHost(tt.explicitSigningHost, tt.region)
+			require.Equal(t, tt.want, got)
+		})
+	}
 }

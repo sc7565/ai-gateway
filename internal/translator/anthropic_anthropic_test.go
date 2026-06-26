@@ -24,9 +24,11 @@ func TestAnthropicToAnthropic_RequestBody(t *testing.T) {
 		body              anthropicschema.MessagesRequest
 		forceBodyMutation bool
 		modelNameOverride string
+		prefix            string
 
 		expRequestModel internalapi.RequestModel
 		expNewBody      []byte
+		expPath         string
 	}{
 		{
 			name:              "no mutation",
@@ -34,8 +36,10 @@ func TestAnthropicToAnthropic_RequestBody(t *testing.T) {
 			body:              anthropicschema.MessagesRequest{Stream: false, Model: "claude-2"},
 			forceBodyMutation: false,
 			modelNameOverride: "",
+			prefix:            "v1",
 			expRequestModel:   "claude-2",
 			expNewBody:        nil,
+			expPath:           "/v1/messages",
 		},
 		{
 			name:              "model override",
@@ -43,8 +47,10 @@ func TestAnthropicToAnthropic_RequestBody(t *testing.T) {
 			body:              anthropicschema.MessagesRequest{Stream: true, Model: "claude-2"},
 			forceBodyMutation: false,
 			modelNameOverride: "claude-100.1",
+			prefix:            "v1",
 			expRequestModel:   "claude-100.1",
 			expNewBody:        []byte(`{"model":"claude-100.1","messages":[{"role":"user","content":"Hello!"}], Stream: true}`),
+			expPath:           "/v1/messages",
 		},
 		{
 			name:              "force mutation",
@@ -52,18 +58,53 @@ func TestAnthropicToAnthropic_RequestBody(t *testing.T) {
 			body:              anthropicschema.MessagesRequest{Stream: false, Model: "claude-2"},
 			forceBodyMutation: true,
 			modelNameOverride: "",
+			prefix:            "v1",
 			expRequestModel:   "claude-2",
 			expNewBody:        []byte(`{"model":"claude-2","messages":[{"role":"user","content":"Hello!"}]}`),
+			expPath:           "/v1/messages",
+		},
+		{
+			name:              "empty prefix yields /messages",
+			original:          []byte(`{"model":"claude-2","messages":[{"role":"user","content":"Hello!"}]}`),
+			body:              anthropicschema.MessagesRequest{Stream: false, Model: "claude-2"},
+			forceBodyMutation: false,
+			modelNameOverride: "",
+			prefix:            "",
+			expRequestModel:   "claude-2",
+			expNewBody:        nil,
+			expPath:           "/messages",
+		},
+		{
+			name:              "custom prefix",
+			original:          []byte(`{"model":"claude-2","messages":[{"role":"user","content":"Hello!"}]}`),
+			body:              anthropicschema.MessagesRequest{Stream: false, Model: "claude-2"},
+			forceBodyMutation: false,
+			modelNameOverride: "",
+			prefix:            "gateway/v1",
+			expRequestModel:   "claude-2",
+			expNewBody:        nil,
+			expPath:           "/gateway/v1/messages",
+		},
+		{
+			name:              "custom prefix with leading slash",
+			original:          []byte(`{"model":"claude-2","messages":[{"role":"user","content":"Hello!"}]}`),
+			body:              anthropicschema.MessagesRequest{Stream: false, Model: "claude-2"},
+			forceBodyMutation: false,
+			modelNameOverride: "",
+			prefix:            "/custom",
+			expRequestModel:   "claude-2",
+			expNewBody:        nil,
+			expPath:           "/custom/messages",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			translator := NewAnthropicToAnthropicTranslator("", tc.modelNameOverride)
+			translator := NewAnthropicToAnthropicTranslator(tc.prefix, tc.modelNameOverride)
 			require.NotNil(t, translator)
 
 			headerMutation, bodyMutation, err := translator.RequestBody(tc.original, &tc.body, tc.forceBodyMutation)
 			require.NoError(t, err)
 			expHeaders := []internalapi.Header{
-				{pathHeaderName, "/v1/messages"},
+				{pathHeaderName, tc.expPath},
 			}
 			if bodyMutation != nil {
 				expHeaders = append(expHeaders, internalapi.Header{contentLengthHeaderName, strconv.Itoa(len(bodyMutation))})
@@ -152,6 +193,51 @@ data: {"type":"message_stop"       }`
 	expected = tokenUsageFrom(10, 1, 0, 16, 26, -1)
 	require.Equal(t, expected, tokenUsage)
 	require.Equal(t, "claude-sonnet-4-5-20250929", responseModel)
+}
+
+func TestAnthropicToAnthropic_ResponseBody_streaming_messageDelta_cacheCreation(t *testing.T) {
+	t.Run("message_start_has_zero_cache_creation_delta_reports_cumulative", func(t *testing.T) {
+		translator := NewAnthropicToAnthropicTranslator("", "")
+		require.NotNil(t, translator)
+		translator.(*anthropicToAnthropicTranslator).stream = true
+
+		const sse = `event: message_start
+data: {"type":"message_start","message":{"model":"claude-haiku-4-5","id":"msg_x","type":"message","role":"assistant","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"service_tier":"standard"}}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":100,"output_tokens":20,"cache_creation_input_tokens":2500,"cache_read_input_tokens":0}}
+
+event: message_stop
+data: {"type":"message_stop"}
+`
+
+		_, _, tokenUsage, responseModel, err := translator.ResponseBody(nil, strings.NewReader(sse), false, nil)
+		require.NoError(t, err)
+		require.Equal(t, "claude-haiku-4-5", responseModel)
+		expected := tokenUsageFrom(2600, 0, 2500, 20, 2620, -1)
+		require.Equal(t, expected, tokenUsage)
+	})
+
+	t.Run("delta_omits_input_tokens_json_zero_recovers_gross_from_message_start", func(t *testing.T) {
+		translator := NewAnthropicToAnthropicTranslator("", "")
+		require.NotNil(t, translator)
+		translator.(*anthropicToAnthropicTranslator).stream = true
+
+		const sse = `event: message_start
+data: {"type":"message_start","message":{"model":"claude-haiku-4-5","id":"msg_y","type":"message","role":"assistant","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":20,"cache_creation_input_tokens":2500}}
+
+event: message_stop
+data: {"type":"message_stop"}
+`
+
+		_, _, tokenUsage, _, err := translator.ResponseBody(nil, strings.NewReader(sse), false, nil)
+		require.NoError(t, err)
+		expected := tokenUsageFrom(2600, 0, 2500, 20, 2620, -1)
+		require.Equal(t, expected, tokenUsage)
+	})
 }
 
 func TestAnthropicToAnthropic_ResponseError(t *testing.T) {
